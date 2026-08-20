@@ -1,4 +1,4 @@
-""" 
+"""
 TeleDrive Organizer Bot (Telegram Only)
 ----------------------------------------
 Developer: iamemon13
@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from threading import Thread
 from urllib.parse import quote_plus
 from flask import Flask
@@ -34,11 +35,14 @@ GROUP_ID = int(os.environ["GROUP_ID"])
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 BACKUP_CHANNEL_ID = int(os.environ["BACKUP_CHANNEL_ID"])
 
+# টপিক আইডিগুলো এখন পরিবেশগত ভেরিয়েবল থেকে রিড করবে
 TOPIC_IDS = {
-    "photo": 6,      # 📷 Photos topic id
-    "video": 7,      # 🎥 Videos topic id
-    "document": 12,  # 📄 Documents topic id
+    "photo": int(os.environ["TOPIC_PHOTO"]),      # 📷 Photos topic id
+    "video": int(os.environ["TOPIC_VIDEO"]),      # 🎥 Videos topic id
+    "document": int(os.environ["TOPIC_DOCUMENT"]),  # 📄 Documents topic id
 }
+
+BD_TIMEZONE = ZoneInfo("Asia/Dhaka")
 
 # ============ RENDER KEEP ALIVE SERVER ============
 
@@ -68,15 +72,10 @@ logger = logging.getLogger(__name__)
 # ============ DATABASE (MongoDB) ============
 
 client = MongoClient(MONGO_URI)
-db = client["teledrive_db"]
+db = client.get_database() # রেন্ডারের URI থেকে ডাটাবেস নাম স্বয়ংক্রিয়ভাবে নেবে
 files_col = db["files"]
 
-def save_file_record(file_type, file_name, caption, thread_id, message_id, channel_msg_id=None, encrypted=False):
-    # ডুপ্লিকেট চেক: যদি একই message_id ইতিমধ্যে ডাটাবেসে থাকে
-    existing = files_col.find_one({"message_id": message_id})
-    if existing:
-        return existing
-
+def save_file_record(file_type, file_name, caption, thread_id, message_id, channel_msg_id=None, file_unique_id=None, encrypted=False):
     record = {
         "file_type": file_type,
         "file_name": file_name or "",
@@ -84,9 +83,10 @@ def save_file_record(file_type, file_name, caption, thread_id, message_id, chann
         "thread_id": thread_id,
         "message_id": message_id,
         "channel_msg_id": channel_msg_id,
+        "file_unique_id": file_unique_id,
         "encrypted": encrypted,
-        "backed_up": False,
-        "date": datetime.now().isoformat()
+        "backed_up": False,  # নতুন ফাইলের জন্য False রাখা হয়েছে যাতে ব্যাকআপ কমান্ড কাজ করে
+        "date": datetime.now(BD_TIMEZONE).isoformat()
     }
     return files_col.insert_one(record)
 
@@ -116,7 +116,6 @@ def cipher_text(text, key, decrypt=False):
 # ============ SEQUENTIAL BACKUP LOGIC (ধারাবাহিক ও ডুপ্লিকেট মুক্ত ব্যাকআপ) ============
 
 async def perform_sequential_backup(bot):
-    # যে ফাইলগুলোর ব্যাকআপ এখনো হয়নি (`backed_up: False` বা ফিল্ড নেই), সেগুলোকে পুরোনো থেকে নতুন ক্রমানুসারে ফেচ করবে
     pending_files = list(files_col.find(
         {"$or": [{"backed_up": {"$exists": False}}, {"backed_up": False}]}
     ).sort("_id", 1))
@@ -129,15 +128,14 @@ async def perform_sequential_backup(bot):
         msg_id = item.get("message_id")
         if msg_id:
             try:
-                if not item.get("backed_up"):
-                    await bot.forward_message(
-                        chat_id=BACKUP_CHANNEL_ID,
-                        from_chat_id=GROUP_ID,
-                        message_id=msg_id
-                    )
-                    files_col.update_one({"_id": item["_id"]}, {"$set": {"backed_up": True}})
-                    count += 1
-                    await asyncio.sleep(1)
+                await bot.forward_message(
+                    chat_id=BACKUP_CHANNEL_ID,
+                    from_chat_id=GROUP_ID,
+                    message_id=msg_id
+                )
+                files_col.update_one({"_id": item["_id"]}, {"$set": {"backed_up": True}})
+                count += 1
+                await asyncio.sleep(1)
             except Exception as e:
                 files_col.update_one({"_id": item["_id"]}, {"$set": {"backed_up": True}})
                 logger.error(f"Failed to forward message id {msg_id}: {e}")
@@ -255,15 +253,23 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_type = "document"
     file_name = ""
+    file_unique_id = None
+    file_id = None
 
     if message.photo:
         file_type = "photo"
         file_name = f"photo_{message.message_id}.jpg"
+        file_id = message.photo[-1].file_id
+        file_unique_id = message.photo[-1].file_unique_id
     elif message.video:
         file_type = "video"
         file_name = f"video_{message.message_id}.mp4"
+        file_id = message.video.file_id
+        file_unique_id = message.video.file_unique_id
     elif message.document:
         file_name = message.document.file_name or "document"
+        file_id = message.document.file_id
+        file_unique_id = message.document.file_unique_id
         ext = file_name.split('.')[-1].lower() if '.' in file_name else ''
         
         if ext in ['jpg', 'jpeg', 'png', 'webp']:
@@ -273,8 +279,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             file_type = "document"
 
+    # ডুপ্লিকেট চেক (যদি file_unique_id আগে থেকেই ডাটাবেসে থাকে)
+    if file_unique_id:
+        existing_file = files_col.find_one({"file_unique_id": file_unique_id})
+        if existing_file:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+
     current_thread = message.message_thread_id
-    target_thread = TOPIC_IDS.get(file_type, 12)
+    target_thread = TOPIC_IDS.get(file_type, TOPIC_IDS["document"])
     
     saved_message_id = message.message_id
     new_caption = (message.caption or "") + f"\n\n#{file_type} #TeleDrive"
@@ -295,22 +311,19 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_msg_id = None
     try:
         if message.photo:
-            file_id = message.photo[-1].file_id
             sent_channel_msg = await context.bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=new_caption)
             channel_msg_id = sent_channel_msg.message_id
         elif message.video:
-            file_id = message.video.file_id
             sent_channel_msg = await context.bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=new_caption)
             channel_msg_id = sent_channel_msg.message_id
         elif message.document:
-            file_id = message.document.file_id
             sent_channel_msg = await context.bot.send_document(chat_id=CHANNEL_ID, document=file_id, caption=new_caption)
             channel_msg_id = sent_channel_msg.message_id
         
-        save_file_record(file_type, file_name, message.caption, target_thread, saved_message_id, channel_msg_id)
+        save_file_record(file_type, file_name, message.caption, target_thread, saved_message_id, channel_msg_id, file_unique_id)
     except Exception as e:
         logger.error(f"Failed to save to backup channel: {e}")
-        save_file_record(file_type, file_name, message.caption, target_thread, saved_message_id)
+        save_file_record(file_type, file_name, message.caption, target_thread, saved_message_id, file_unique_id=file_unique_id)
 
 # ============ MAIN ============
 
@@ -340,4 +353,5 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
     
